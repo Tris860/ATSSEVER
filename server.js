@@ -1,6 +1,7 @@
 /******************************************************************
  * ATS CONTROL SERVER — Pure WebSocket + Express
  * Devices (ESP/Wemos) and browsers connect via raw WebSocket
+ * Supports reconnection protocol with "TRY_AGAIN" signal
  ******************************************************************/
 
 const http = require("http");
@@ -34,9 +35,6 @@ const authenticatedClients = new Map(); // deviceName → WebSocket
 --------------------------------------------- */
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-function safeWrite(socket, data) {
-  try { socket.write(data); } catch (e) {}
 }
 
 /* ---------------------------------------------
@@ -126,7 +124,7 @@ wss.on("connection", async (ws, req) => {
   const auth = await authenticateClient(req.headers);
   if (!auth) {
     log("Client rejected due to failed authentication");
-    ws.close(1008, "Unauthorized"); // policy violation
+    ws.close(1008, "Unauthorized");
     return;
   }
 
@@ -152,16 +150,20 @@ wss.on("connection", async (ws, req) => {
   ws.on("close", (code, reason) => {
     authenticatedClients.delete(deviceName);
     log(`Device '${deviceName}' disconnected. code=${code}, reason=${reason}`);
+
+    // Send TRY_AGAIN signal to prompt reconnection
+    try { ws.send("TRY_AGAIN"); } catch (e) {}
   });
 
   ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("ping", () => { log(`Received ping from ${deviceName}`); });
 });
 
 /* ---------------------------------------------
    EXPRESS ROUTE
 --------------------------------------------- */
 app.get("/", (req, res) => {
-  res.send("ATS Pure WebSocket Server Running on Render");
+  res.send("ATS Pure WebSocket Server Running on Render (with TRY_AGAIN reconnection protocol)");
 });
 
 /* ---------------------------------------------
@@ -178,6 +180,7 @@ setInterval(() => {
   authenticatedClients.forEach((ws, deviceName) => {
     if (ws.isAlive === false) {
       log(`Terminating dead client: ${deviceName}`);
+      try { ws.send("TRY_AGAIN"); } catch (e) {}
       return ws.terminate();
     }
     ws.isAlive = false;
