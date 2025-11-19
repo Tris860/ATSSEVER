@@ -1,7 +1,11 @@
+/******************************************************************
+ * ATS CONTROL SERVER — Pure WebSocket + Express
+ * Devices (ESP/Wemos) and browsers connect via raw WebSocket
+ ******************************************************************/
+
 const http = require("http");
 const WebSocket = require("ws");
 const express = require("express");
-const { Server } = require("socket.io");
 const { URLSearchParams } = require("url");
 
 /* ---------------------------------------------
@@ -10,8 +14,6 @@ const { URLSearchParams } = require("url");
 const PORT = process.env.PORT || 4000;
 const WEMOS_AUTH_URL = process.env.WEMOS_AUTH_URL ||
   "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth";
-const USER_DEVICE_LOOKUP_URL = process.env.USER_DEVICE_LOOKUP_URL ||
-  "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=get_user_device";
 const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL ||
   "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period";
 
@@ -20,16 +22,12 @@ const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL ||
 --------------------------------------------- */
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-const webNS = io.of("/web");
+const wss = new WebSocket.Server({ server });
 
 /* ---------------------------------------------
    STATE STORAGE
 --------------------------------------------- */
-const authenticatedWemos = new Map(); // deviceName → WebSocket
-const userWebClients = new Map();     // email → Set(Socket)
-const userToWemosCache = new Map();   // email → deviceName
+const authenticatedClients = new Map(); // deviceName → WebSocket
 
 /* ---------------------------------------------
    LOG HELPERS
@@ -42,53 +40,19 @@ function safeWrite(socket, data) {
 }
 
 /* ---------------------------------------------
-   USER → DEVICE CACHE LOOKUP
+   AUTHENTICATION
 --------------------------------------------- */
-async function getCachedWemosDeviceNameForUser(email) {
-  if (!email) return null;
-  if (userToWemosCache.has(email)) return userToWemosCache.get(email);
+async function authenticateClient(headers) {
+  const usernameRaw = headers["x-username"];
+  const passwordRaw = headers["x-password"];
 
-  const post = new URLSearchParams();
-  post.append("action", "get_user_device");
-  post.append("email", email);
+  // Handle comma-separated duplicates
+  const username = usernameRaw?.split(",")[0].trim();
+  const password = passwordRaw?.split(",")[0].trim();
 
-  try {
-    const resp = await fetch(USER_DEVICE_LOOKUP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: post.toString()
-    });
+  log(`Authenticating client username=${username}, password=${password}`);
 
-    log(`Lookup POST → status=${resp.status}`);
-    const data = await resp.json();
-    log(`Lookup response JSON: ${JSON.stringify(data)}`);
-
-    if (data.success && data.device_name) {
-      userToWemosCache.set(email, data.device_name);
-      return data.device_name;
-    }
-  } catch (err) {
-    log("get_user_device error: " + err.message);
-  }
-  return null;
-}
-
-/* ---------------------------------------------
-   RAW WEMOS AUTHENTICATION + UPGRADE
---------------------------------------------- */
-async function authenticateAndUpgradeWemos(req, socket, head) {
-  log(`Incoming WS upgrade → path=${req.url}, headers=${JSON.stringify(req.headers)}`);
-
-  const username = req.headers["x-username"];
-  const password = req.headers["x-password"];
-  log(`Authenticating Wemos username=${username}, password=${password}`);
-
-  if (!username || !password) {
-    safeWrite(socket, "HTTP/1.1 400 Bad Request\r\n\r\n");
-    log("Missing username/password headers");
-    socket.destroy();
-    return;
-  }
+  if (!username || !password) return null;
 
   try {
     const post = new URLSearchParams();
@@ -112,52 +76,21 @@ async function authenticateAndUpgradeWemos(req, socket, head) {
       data = JSON.parse(raw);
     } catch (err) {
       log("Auth JSON parse error: " + err.message);
-      safeWrite(socket, "HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      socket.destroy();
-      return;
+      return null;
     }
 
     if (!data || !data.success) {
       log("Auth failed or missing 'success' flag");
-      safeWrite(socket, "HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
+      return null;
     }
 
-    const deviceName = data.data?.device_name || username;
-    const initialCommand = data.data?.hard_switch_enabled ? "HARD_ON" : "HARD_OFF";
-
-    wss.handleUpgrade(req, socket, head, ws => {
-      log(`Upgrade successful for device=${deviceName}`);
-      ws.isWemos = true;
-      ws.wemosName = deviceName;
-      ws.isAlive = true;
-
-      const old = authenticatedWemos.get(deviceName);
-      if (old && old.readyState === WebSocket.OPEN) {
-        log(`Terminating old connection for device=${deviceName}`);
-        try { old.terminate(); } catch (e) {}
-      }
-      authenticatedWemos.set(deviceName, ws);
-
-      try { ws.send(initialCommand); } catch (e) {}
-
-      ws.on("message", msg => {
-        log(`Wemos ${deviceName} → ${msg}`);
-      });
-
-      ws.on("close", (code, reason) => {
-        authenticatedWemos.delete(deviceName);
-        log(`Wemos '${deviceName}' disconnected. code=${code}, reason=${reason}`);
-      });
-
-      wss.emit("connection", ws, req);
-    });
-
+    return {
+      deviceName: data.data?.device_name || username,
+      initialCommand: data.data?.hard_switch_enabled ? "HARD_ON" : "HARD_OFF"
+    };
   } catch (err) {
-    safeWrite(socket, "HTTP/1.1 500 Internal Server Error\r\n\r\n");
     log("Auth exception: " + err.message);
-    socket.destroy();
+    return null;
   }
 }
 
@@ -173,7 +106,7 @@ async function checkPhpBackend() {
 
     if (data.success === true) {
       log("AUTO_ON triggered globally.");
-      authenticatedWemos.forEach(ws => {
+      authenticatedClients.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) {
           try { ws.send("AUTO_ON"); } catch (e) {}
         }
@@ -185,49 +118,50 @@ async function checkPhpBackend() {
 }
 
 /* ---------------------------------------------
-   HTTP UPGRADE
+   WEBSOCKET CONNECTION HANDLER
 --------------------------------------------- */
-server.on("upgrade", (req, socket, head) => {
-  const pathname = req.url.split("?")[0];
-  log(`HTTP upgrade request → pathname=${pathname}`);
-  if (pathname === "/wemos") {
-    authenticateAndUpgradeWemos(req, socket, head);
-  } else {
-    log("Upgrade rejected: invalid path");
-    socket.destroy();
-  }
-});
+wss.on("connection", async (ws, req) => {
+  log(`Incoming WS connection → path=${req.url}, headers=${JSON.stringify(req.headers)}`);
 
-/* ---------------------------------------------
-   WEB CLIENTS (Socket.IO)
---------------------------------------------- */
-webNS.on("connection", async socket => {
-  const email = socket.handshake.query.user;
-  log(`Web client connected: ${email}`);
-  if (email) {
-    let set = userWebClients.get(email);
-    if (!set) {
-      set = new Set();
-      userWebClients.set(email, set);
-    }
-    set.add(socket);
+  const auth = await authenticateClient(req.headers);
+  if (!auth) {
+    log("Client rejected due to failed authentication");
+    ws.close(1008, "Unauthorized"); // policy violation
+    return;
   }
 
-  socket.on("disconnect", () => {
-    const set = userWebClients.get(email);
-    if (set) {
-      set.delete(socket);
-      if (set.size === 0) userWebClients.delete(email);
-    }
-    log(`Web client disconnected: ${email}`);
+  const { deviceName, initialCommand } = auth;
+  log(`Upgrade successful for device=${deviceName}`);
+
+  // Replace old connection if exists
+  const old = authenticatedClients.get(deviceName);
+  if (old && old.readyState === WebSocket.OPEN) {
+    log(`Terminating old connection for device=${deviceName}`);
+    try { old.terminate(); } catch (e) {}
+  }
+  authenticatedClients.set(deviceName, ws);
+
+  try { ws.send(initialCommand); } catch (e) {}
+
+  ws.isAlive = true;
+
+  ws.on("message", msg => {
+    log(`Device ${deviceName} → ${msg}`);
   });
+
+  ws.on("close", (code, reason) => {
+    authenticatedClients.delete(deviceName);
+    log(`Device '${deviceName}' disconnected. code=${code}, reason=${reason}`);
+  });
+
+  ws.on("pong", () => { ws.isAlive = true; });
 });
 
 /* ---------------------------------------------
    EXPRESS ROUTE
 --------------------------------------------- */
 app.get("/", (req, res) => {
-  res.send("ATS Hybrid WebSocket Server Running on Render");
+  res.send("ATS Pure WebSocket Server Running on Render");
 });
 
 /* ---------------------------------------------
@@ -239,17 +173,14 @@ server.listen(PORT, () => {
   setInterval(checkPhpBackend, 60000);
 });
 
+// Heartbeat to keep sockets alive
 setInterval(() => {
-  authenticatedWemos.forEach((ws, deviceName) => {
+  authenticatedClients.forEach((ws, deviceName) => {
     if (ws.isAlive === false) {
-      log(`Terminating dead Wemos: ${deviceName}`);
+      log(`Terminating dead client: ${deviceName}`);
       return ws.terminate();
     }
     ws.isAlive = false;
     try { ws.ping(); } catch (e) {}
   });
 }, 30000);
-
-wss.on("connection", ws => {
-  ws.on("pong", () => { ws.isAlive = true; });
-});
