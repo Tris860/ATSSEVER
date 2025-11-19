@@ -3,7 +3,7 @@
  * Devices (ESP/Wemos) and browsers connect via raw WebSocket
  * Supports reconnection protocol with "TRY_AGAIN" signal
  * Webpage clients mapped to Wemos devices via email
- * Web clients notified of device connection status + AUTO_ON events
+ * Web clients notied of device connection status + AUTO_ON events
  ******************************************************************/
 
 const http = require("http");
