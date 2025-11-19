@@ -1,8 +1,3 @@
-/******************************************************************
- *  TRIS TECH HUB — ATS CONTROL SERVER (Render-ready + Debugging)
- *  Hybrid WebSocket (Wemos) + Socket.IO (Web UI)
- ******************************************************************/
-
 const http = require("http");
 const WebSocket = require("ws");
 const express = require("express");
@@ -25,10 +20,6 @@ const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL ||
 --------------------------------------------- */
 const app = express();
 const server = http.createServer(app);
-
-/* ---------------------------------------------
-   WEBSOCKET SERVERS
---------------------------------------------- */
 const wss = new WebSocket.Server({ noServer: true });
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 const webNS = io.of("/web");
@@ -113,15 +104,22 @@ async function authenticateAndUpgradeWemos(req, socket, head) {
 
     log(`Auth POST → status=${resp.status}, content-type=${resp.headers.get("content-type")}`);
 
-    const data = await resp.json().catch(err => {
-      log("Auth JSON parse error: " + err.message);
-      return {};
-    });
-    log(`Auth response JSON: ${JSON.stringify(data)}`);
+    const raw = await resp.text();
+    log(`Raw auth response: ${raw}`);
 
-    if (!data.success) {
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      log("Auth JSON parse error: " + err.message);
+      safeWrite(socket, "HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    if (!data || !data.success) {
+      log("Auth failed or missing 'success' flag");
       safeWrite(socket, "HTTP/1.1 401 Unauthorized\r\n\r\n");
-      log(`Auth failed for username=${username}`);
       socket.destroy();
       return;
     }
@@ -206,10 +204,21 @@ server.on("upgrade", (req, socket, head) => {
 webNS.on("connection", async socket => {
   const email = socket.handshake.query.user;
   log(`Web client connected: ${email}`);
-  if (email) addWebClientForUser(email, socket);
+  if (email) {
+    let set = userWebClients.get(email);
+    if (!set) {
+      set = new Set();
+      userWebClients.set(email, set);
+    }
+    set.add(socket);
+  }
 
   socket.on("disconnect", () => {
-    removeWebClientForUser(email, socket);
+    const set = userWebClients.get(email);
+    if (set) {
+      set.delete(socket);
+      if (set.size === 0) userWebClients.delete(email);
+    }
     log(`Web client disconnected: ${email}`);
   });
 });
@@ -230,7 +239,6 @@ server.listen(PORT, () => {
   setInterval(checkPhpBackend, 60000);
 });
 
-// Heartbeat to keep Wemos sockets alive
 setInterval(() => {
   authenticatedWemos.forEach((ws, deviceName) => {
     if (ws.isAlive === false) {
