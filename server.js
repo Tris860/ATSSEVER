@@ -1,6 +1,7 @@
 /******************************************************************
  * WEMOS SERVER — Handles ESP device connections only
  * Authenticates via PHP backend, sends commands, listens for pings
+ * Maintains connection with heartbeat + TRY_AGAIN signal
  ******************************************************************/
 
 const http = require("http");
@@ -9,14 +10,17 @@ const express = require("express");
 const { URLSearchParams } = require("url");
 
 const PORT = process.env.PORT || 4001;
-const WEMOS_AUTH_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth";
-const AUTO_TRIGGER_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period";
+const WEMOS_AUTH_URL =
+  "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth";
+const AUTO_TRIGGER_URL =
+  "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period";
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/wemos" });
 
 const connectedDevices = new Map(); // deviceName → WebSocket
+const heartbeatState = new Map();   // deviceName → missedCount
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -29,10 +33,10 @@ async function authenticateDevice(headers) {
   if (!username || !password) return null;
 
   const post = new URLSearchParams();
+  post.append("action", "wemos_auth"); // ✅ required
   post.append("username", username);
-  post.append("action", "wemos_auth");
   post.append("password", password);
- console.log(post.toString());
+
   try {
     const resp = await fetch(WEMOS_AUTH_URL, {
       method: "POST",
@@ -94,6 +98,7 @@ wss.on("connection", async (ws, req) => {
 
   ws.send(initialCommand);
   ws.isAlive = true;
+  heartbeatState.set(deviceName, 0);
 
   ws.on("message", msg => {
     log(`Device ${deviceName} → ${msg}`);
@@ -101,21 +106,33 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("pong", () => {
     ws.isAlive = true;
+    heartbeatState.set(deviceName, 0);
+    log(`Received pong from ${deviceName}`);
   });
 
   ws.on("close", () => {
     connectedDevices.delete(deviceName);
+    heartbeatState.delete(deviceName);
     log(`Device ${deviceName} disconnected.`);
   });
 });
 
-// Heartbeat
+// Heartbeat with grace period
 setInterval(() => {
   connectedDevices.forEach((ws, deviceName) => {
     if (!ws.isAlive) {
-      log(`Device ${deviceName} timed out.`);
-      ws.terminate();
-      connectedDevices.delete(deviceName);
+      const missed = heartbeatState.get(deviceName) || 0;
+      if (missed >= 1) {
+        log(`Device ${deviceName} missed 2 heartbeats. Sending TRY_AGAIN and terminating.`);
+        try { ws.send("TRY_AGAIN"); } catch (e) {}
+        ws.terminate();
+        connectedDevices.delete(deviceName);
+        heartbeatState.delete(deviceName);
+      } else {
+        log(`Device ${deviceName} missed 1 heartbeat. Grace period started.`);
+        heartbeatState.set(deviceName, missed + 1);
+        ws.ping();
+      }
     } else {
       ws.isAlive = false;
       ws.ping();
