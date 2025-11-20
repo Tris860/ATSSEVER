@@ -30,8 +30,9 @@ async function authenticateDevice(headers) {
 
   const post = new URLSearchParams();
   post.append("username", username);
+  post.append("action", "wemos_auth");
   post.append("password", password);
-
+ console.log(post.toString());
   try {
     const resp = await fetch(WEMOS_AUTH_URL, {
       method: "POST",
