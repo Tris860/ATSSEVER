@@ -122,14 +122,13 @@ setInterval(() => {
   connectedDevices.forEach((ws, deviceName) => {
     if (!ws.isAlive) {
       const missed = heartbeatState.get(deviceName) || 0;
-      if (missed >= 1) {
-        log(`Device ${deviceName} missed 2 heartbeats. Sending TRY_AGAIN and terminating.`);
-        try { ws.send("TRY_AGAIN"); } catch (e) {}
+      if (missed >= 2) { // allow 2 misses
+        log(`Device ${deviceName} missed 3 heartbeats. Terminating.`);
         ws.terminate();
         connectedDevices.delete(deviceName);
         heartbeatState.delete(deviceName);
       } else {
-        log(`Device ${deviceName} missed 1 heartbeat. Grace period started.`);
+        log(`Device ${deviceName} missed heartbeat #${missed+1}.`);
         heartbeatState.set(deviceName, missed + 1);
         ws.ping();
       }
@@ -138,7 +137,8 @@ setInterval(() => {
       ws.ping();
     }
   });
-}, 30000);
+}, 45000); // ping every 45s
+
 
 // AUTO trigger check every minute
 setInterval(checkAutoTrigger, 60000);
