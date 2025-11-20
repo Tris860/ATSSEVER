@@ -2,12 +2,14 @@
  * WEMOS SERVER — Handles ESP device connections only
  * Authenticates via PHP backend, sends commands, listens for pings
  * Maintains connection with heartbeat + TRY_AGAIN signal
+ * Enhanced with auth retries, rate-limiting, immediate pings, and better logging
  ******************************************************************/
 
 const http = require("http");
 const WebSocket = require("ws");
 const express = require("express");
 const { URLSearchParams } = require("url");
+const { RateLimiterMemory } = require("rate-limiter-flexible");
 
 const PORT = process.env.PORT || 4001;
 const WEMOS_AUTH_URL =
@@ -22,41 +24,51 @@ const wss = new WebSocket.Server({ server, path: "/wemos" });
 const connectedDevices = new Map(); // deviceName → WebSocket
 const heartbeatState = new Map();   // deviceName → missedCount
 
+// Rate limiter: 10 auth attempts per minute per IP
+const authLimiter = new RateLimiterMemory({ points: 10, duration: 60 });
+
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// Authenticate device via PHP backend
+// Authenticate device via PHP backend with retries
 async function authenticateDevice(headers) {
   const username = headers["x-username"]?.split(",")[0].trim();
   const password = headers["x-password"]?.split(",")[0].trim();
   if (!username || !password) return null;
 
   const post = new URLSearchParams();
-  post.append("action", "wemos_auth"); // ✅ required
+  post.append("action", "wemos_auth");
   post.append("username", username);
   post.append("password", password);
 
-  try {
-    const resp = await fetch(WEMOS_AUTH_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: post.toString()
-    });
+  let attempts = 0;
+  const maxAttempts = 3;
+  while (attempts < maxAttempts) {
+    try {
+      const resp = await fetch(WEMOS_AUTH_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: post.toString()
+      });
 
-    const raw = await resp.text();
-    log(`Auth response: ${raw}`);
-    const data = JSON.parse(raw);
-    if (!data.success) return null;
+      const raw = await resp.text();
+      log(`Auth response: ${raw}`);
+      const data = JSON.parse(raw);
+      if (!data.success) return null;
 
-    return {
-      deviceName: data.data?.device_name || username,
-      initialCommand: data.data?.hard_switch_enabled ? "HARD_ON" : "HARD_OFF"
-    };
-  } catch (err) {
-    log("Auth error: " + err.message);
-    return null;
+      return {
+        deviceName: data.data?.device_name || username,
+        initialCommand: data.data?.hard_switch_enabled ? "HARD_ON" : "HARD_OFF"
+      };
+    } catch (err) {
+      attempts++;
+      log(`Auth attempt ${attempts} failed: ${err.message}. Retrying in ${attempts * 2}s...`);
+      await new Promise(resolve => setTimeout(resolve, attempts * 2000)); // Backoff: 2s, 4s, etc.
+    }
   }
+  log("Auth max retries exceeded.");
+  return null;
 }
 
 // Broadcast AUTO_ON to all connected devices
@@ -77,8 +89,21 @@ async function checkAutoTrigger() {
   }
 }
 
+// Log upgrade requests
+wss.on("upgrade", (request, socket, head) => {
+  log(`WebSocket upgrade requested from ${request.connection.remoteAddress}`);
+});
+
 // Handle incoming device connection
 wss.on("connection", async (ws, req) => {
+  try {
+    await authLimiter.consume(req.connection.remoteAddress); // Rate-limit by IP
+  } catch (rejRes) {
+    log(`Rate limit exceeded for ${req.connection.remoteAddress}`);
+    ws.close(1013, "Try again later"); // 1013 = Temporary overload
+    return;
+  }
+
   const auth = await authenticateDevice(req.headers);
   if (!auth) {
     log("Device rejected: failed auth");
@@ -100,6 +125,10 @@ wss.on("connection", async (ws, req) => {
   ws.isAlive = true;
   heartbeatState.set(deviceName, 0);
 
+  // Send immediate ping to verify connection
+  ws.ping();
+  log(`Sent initial ping to ${deviceName}`);
+
   ws.on("message", msg => {
     log(`Device ${deviceName} → ${msg}`);
   });
@@ -108,6 +137,10 @@ wss.on("connection", async (ws, req) => {
     ws.isAlive = true;
     heartbeatState.set(deviceName, 0);
     log(`Received pong from ${deviceName}`);
+  });
+
+  ws.on("error", err => {
+    log(`WS error for ${deviceName}: ${err.message}`);
   });
 
   ws.on("close", () => {
@@ -138,7 +171,6 @@ setInterval(() => {
     }
   });
 }, 45000); // ping every 45s
-
 
 // AUTO trigger check every minute
 setInterval(checkAutoTrigger, 60000);
