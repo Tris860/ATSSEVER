@@ -49,10 +49,8 @@ async function authenticateAndUpgradeWemos(request, socket, head, wss) {
     currentAuths++;
 
     // ----- Extract headers -----
-    const urlParams = new URL(request.url, `http://${request.headers.host}`).searchParams;
-    const username = urlParams.get("username");
-    const password = urlParams.get("password");
-
+    const username = request.headers["x-username"];
+    const password = request.headers["x-password"];
 
     if (!username || !password) {
       socket.write("HTTP/1.1 400 Bad Request\r\n\r\nMissing credentials");
