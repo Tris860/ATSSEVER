@@ -1,6 +1,6 @@
 const express = require('express');
 const expressWs = require('express-ws')(express());
-const fetch = require('node-fetch'); // make sure to install this
+
 const app = expressWs.app;
 
 const PORT = process.env.PORT || 3000;  // Render sets PORT automatically
