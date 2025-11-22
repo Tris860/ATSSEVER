@@ -49,6 +49,7 @@ app.ws('/', (ws, req) => {
     });
   });
 
+  setInterval(checkPhpBackend, 60000);
   // Handle pings for keepalive
   ws.on('pong', () => {
     console.log('Pong received');
@@ -58,10 +59,8 @@ app.ws('/', (ws, req) => {
   const pingInterval = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
       ws.ping();
-
-      checkPhpBackend();
     }
-  }, 30000);  // Every 30 seconds
+  }, 60000);  // Every 30 seconds
 
   ws.on('close', () => clearInterval(pingInterval));
 });
@@ -108,8 +107,8 @@ async function checkPhpBackend() {
   }
 }
 
-// // Run polling every 60 seconds
-// setInterval(checkPhpBackend, 60000);
+// Run polling every 60 seconds
+
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
