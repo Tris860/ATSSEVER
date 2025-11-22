@@ -1,115 +1,179 @@
-const express = require('express');
-const expressWs = require('express-ws')(express());
-//const fetch = require('node-fetch'); // make sure to install this
-const app = expressWs.app;
+const http = require('http');
+const url = require('url');
+const WebSocket = require('ws');
+const fetch = require('node-fetch');
 
-const PORT = process.env.PORT || 3000;  // Render sets PORT automatically
-const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL || 'https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period';
+const PORT = process.env.PORT || 4000;
 
-// Track connected clients
-const authenticatedWemos = new Map(); // deviceName -> ws
-const userWebClients = new Map();      // username -> Set of ws
+// PHP backend endpoint
+const PHP_BACKEND_URL = 'https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period';
+const USER_DEVICE_LOOKUP_URL = 'https://tristechhub.org.rw/projects/ATS/backend/main.php?action=get_user_device';
 
-// HTTP route for health checks (required for Render)
-app.get('/', (req, res) => {
-  res.send('WebSocket server is running');
+// WebSocket server
+const wss = new WebSocket.Server({ noServer: true });
+
+// Maps
+const userWebClients = new Map();     // userEmail -> Set(WebSocket)
+const userToWemosCache = new Map();   // userEmail -> deviceName
+
+// Normalize headers
+function headerFirst(request, name) {
+  const v = request.headers[name.toLowerCase()];
+  if (!v) return null;
+  if (Array.isArray(v)) return (v[0] || '').trim();
+  return String(v).split(',')[0].trim();
+}
+
+// Cached device lookup
+async function getCachedWemosDeviceNameForUser(userEmail) {
+  if (!userEmail) return null;
+  if (userToWemosCache.has(userEmail)) return userToWemosCache.get(userEmail);
+
+  const postData = new URLSearchParams();
+  postData.append('action', 'get_user_device');
+  postData.append('email', userEmail);
+
+  try {
+    const resp = await fetch(USER_DEVICE_LOOKUP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: postData.toString()
+    });
+    const raw = await resp.text();
+    console.log("RAW PHP RESPONSE (device lookup):", raw);
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { return null; }
+    if (data.success && data.device_name) {
+      userToWemosCache.set(userEmail, data.device_name);
+      return data.device_name;
+    }
+    return null;
+  } catch (err) {
+    console.error('getCachedWemosDeviceNameForUser error:', err.message);
+    return null;
+  }
+}
+
+// Web client management
+function addWebClientForUser(email, ws) {
+  if (!email) return;
+  let set = userWebClients.get(email);
+  if (!set) { set = new Set(); userWebClients.set(email, set); }
+  set.add(ws);
+}
+function removeWebClientForUser(email, ws) {
+  if (!email) return;
+  const set = userWebClients.get(email);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) userWebClients.delete(email);
+}
+
+// HTTP server
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('WebSocket server running\n');
 });
 
-// WebSocket route
-app.ws('/', (ws, req) => {
-  console.log('Client connected');
+// Upgrade handler for web clients
+server.on('upgrade', (request, socket, head) => {
+  const parsed = url.parse(request.url, true);
+  const webUserQuery = parsed.query.user || null;
 
-  ws.on('message', (message) => {
-    console.log(`Received: ${message}`);
-    ws.send(`Echo: ${message}`);  // Echo back
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    ws.webUsername = webUserQuery;
+    ws.isAlive = true;
+    console.log(`Webpage client connected. user=${ws.webUsername}`);
+  });
+});
 
-    // Example: classify client type
-    if (message.startsWith('WEMOS:')) {
-      const deviceName = message.split(':')[1] || 'unknown';
-      authenticatedWemos.set(deviceName, ws);
-      console.log(`Registered Wemos device: ${deviceName}`);
-    } else if (message.startsWith('USER:')) {
-      const username = message.split(':')[1] || 'guest';
-      if (!userWebClients.has(username)) {
-        userWebClients.set(username, new Set());
-      }
-      userWebClients.get(username).add(ws);
-      console.log(`Registered user client: ${username}`);
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  const userEmail = ws.webUsername;
+  if (userEmail) addWebClientForUser(userEmail, ws);
+
+  ws.on('message', async (msg) => {
+    const text = msg.toString();
+    ws.isAlive = true;
+
+    if (!userEmail) {
+      try { ws.send('MESSAGE_FAILED:NoUserIdentity'); } catch (e) {}
+      return;
     }
+
+    let deviceName = userToWemosCache.get(userEmail);
+    if (!deviceName) {
+      deviceName = await getCachedWemosDeviceNameForUser(userEmail);
+    }
+    if (!deviceName) {
+      try { ws.send('MESSAGE_FAILED:NoDeviceAssigned'); } catch (e) {}
+      return;
+    }
+
+    // No Wemos forwarding — just acknowledge
+    try { ws.send('MESSAGE_RECEIVED'); } catch (e) {}
   });
 
   ws.on('close', () => {
-    console.log('Client disconnected');
-    // Clean up from maps
-    authenticatedWemos.forEach((client, name) => {
-      if (client === ws) authenticatedWemos.delete(name);
-    });
-    userWebClients.forEach((set, username) => {
-      if (set.has(ws)) set.delete(ws);
-    });
-  });
-
-  setInterval(checkPhpBackend, 60000);
-  // Handle pings for keepalive
-  ws.on('pong', () => {
-    console.log('Pong received');
-  });
-
-  // Send periodic pings to detect dead connections
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === ws.OPEN) {
-      ws.ping();
+    if (userEmail) {
+      removeWebClientForUser(userEmail, ws);
+      console.log(`Webpage client disconnected. user=${userEmail}`);
     }
-  }, 60000);  // Every 30 seconds
+  });
 
-  ws.on('close', () => clearInterval(pingInterval));
+  ws.on('error', (err) => console.error('Web client error:', err.message));
 });
 
-// Polling function
+// Heartbeat
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      const id = ws.webUsername || 'unknown';
+      console.log(`Terminating dead socket for '${id}'`);
+      try { ws.terminate(); } catch (e) {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (e) {}
+  });
+}, 30000);
+
+// PHP backend check
 async function checkPhpBackend() {
   try {
     const resp = await fetch(PHP_BACKEND_URL);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const raw = await resp.text();
     let data;
-    try { data = JSON.parse(raw); } catch (e) { return; }
+    try { data = JSON.parse(raw); } catch (e) {
+      console.error("Failed to parse backend response:", raw);
+      return;
+    }
 
     if (data.success === true) {
-      const messageToWemos = 'AUTO_ON';
       const messageToWeb = 'TIME_MATCHED: ' + data.message + ": " + data.id;
 
-      // Notify Wemos devices
-      authenticatedWemos.forEach((client, deviceName) => {
-        if (client.readyState === client.OPEN) {
-          try {
-            client.send(messageToWemos);
-            console.log(`Sent ${messageToWemos} to ${deviceName}`);
-          } catch (e) {}
-        }
-      });
-
-      // Notify browser clients
       userWebClients.forEach((set) => {
         set.forEach(client => {
-          if (client.readyState === client.OPEN) {
+          if (client.readyState === WebSocket.OPEN) {
             try { client.send(messageToWeb); } catch (e) {}
           }
         });
       });
-    }
-    else{
-      console.log('PHP backend response indicates failure:', data);
-      console.log(`[${new Date().toISOString()}] PHP backend response:`, data);
-
+    } else {
+      console.log("PHP backend response indicates failure:", data);
     }
   } catch (err) {
     console.error('checkPhpBackend error:', err.message);
   }
 }
 
-// Run polling every 60 seconds
-
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+// Start server
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT}.`);
+  checkPhpBackend();
+  setInterval(checkPhpBackend, 60000);
 });
