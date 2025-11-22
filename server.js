@@ -58,6 +58,8 @@ app.ws('/', (ws, req) => {
   const pingInterval = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
       ws.ping();
+
+      checkPhpBackend();
     }
   }, 30000);  // Every 30 seconds
 
@@ -106,8 +108,8 @@ async function checkPhpBackend() {
   }
 }
 
-// Run polling every 60 seconds
-setInterval(checkPhpBackend, 60000);
+// // Run polling every 60 seconds
+// setInterval(checkPhpBackend, 60000);
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
