@@ -4,7 +4,7 @@ const expressWs = require('express-ws')(express());
 const app = expressWs.app;
 
 const PORT = process.env.PORT || 3000;  // Render sets PORT automatically
-const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL || 'https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth';
+const PHP_BACKEND_URL = process.env.PHP_BACKEND_URL || 'https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period';
 
 // Track connected clients
 const authenticatedWemos = new Map(); // deviceName -> ws
