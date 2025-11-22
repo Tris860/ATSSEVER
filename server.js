@@ -96,6 +96,9 @@ async function checkPhpBackend() {
         });
       });
     }
+    else{
+      console.log('PHP backend response indicates failure:', data);
+    }
   } catch (err) {
     console.error('checkPhpBackend error:', err.message);
   }
