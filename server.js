@@ -98,6 +98,8 @@ async function checkPhpBackend() {
     }
     else{
       console.log('PHP backend response indicates failure:', data);
+      console.log(`[${new Date().toISOString()}] PHP backend response:`, data);
+
     }
   } catch (err) {
     console.error('checkPhpBackend error:', err.message);
